@@ -1,0 +1,12 @@
+# Uncomment to enable Azure Monitor OpenTelemetry
+# Ref: aka.ms/functions-azure-monitor-python
+# azure-monitor-opentelemetry
+
+azure-functions
+Pillow
+openai
+torch
+numpy==1.26.4
+requests
+-f https://download.pytorch.org/whl/torch_stable.html 
+torch==2.3.1+cpu
