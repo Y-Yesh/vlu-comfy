@@ -82,9 +82,9 @@ def binary_to_comfyui_image(
         image = image.convert('RGB')
     
     # Resize if target size is specified
-    if target_size is not None:
+    """if target_size is not None:
         width, height = target_size
-        image = image.resize((width, height), Image.Resampling.LANCZOS)
+        image = image.resize((width, height), Image.Resampling.LANCZOS)"""
     
     # Convert to numpy array and normalize to [0, 1]
     image_array = np.array(image).astype(np.float32) / 255.0
