@@ -10,3 +10,5 @@ numpy==1.26.4
 requests
 -f https://download.pytorch.org/whl/torch_stable.html 
 torch==2.3.1+cpu
+google-genai
+google

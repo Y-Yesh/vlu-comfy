@@ -11,23 +11,25 @@ from typing import Tuple
 from PIL import Image
 from openai import OpenAI
 import requests
-from google import genai
-from google.genai import types
 
 
-from helps import *
-from helps import _to_png_bytes
+from helps import _save_temp, _to_png_bytes, encode_image, common_upscale, PREFERED_KONTEXT_RESOLUTIONS, Angle_Kontext_Prompt, Color_Grade_Kontext_Prompt, binary_to_comfyui_image, scale, comfyui_image_to_binary, get_aspect_ratio, poll_for_result
 
 # Maximum file size in bytes (10 MB)
 MAX_BYTES = 10 * 10024 * 10024
 
-
+# Camera angle options for AI angle change
+CAMERA_ANGLE_OPTIONS = [
+    "Slight Pan left",
+    "Slight Pan right",
+    "Tilt up",
+    "Tilt down",
+    "Eye-level shot",
+    "Top-down"
+]
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 client = OpenAI(api_key="")
-
-client_google = genai.Client(api_key="")
-
 url = "https://api.bfl.ai/v1/flux-kontext-max"
 
 payload = {
@@ -45,320 +47,7 @@ api_headers = {
     "Content-Type": "application/json"
 }
 
-@app.route(route="angle-change-upscale")
-def fix_and_upscale(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Fix and upscale character images using two input images.
-    Expects multipart/form-data with:
-    - original_image (file) - reference image
-    - qwen_generated (file) - generated image to improve
-    """
-    try:
-        # Start overall timing
-        import time
-        overall_start_time = time.time()
-        
-        # Expect multipart/form-data with two image files
-        files = req.files or {}
-        form = req.form or {}
-        
-        logging.info(f"Entered fix_and_upscale")
-        logging.info(f"Request: {req}")
-        logging.info(f"Form: {form}")
-        logging.info(f"Files: {list(files.keys())}")
-        
-        # Get the two required images - matching frontend field names
-        input_image_file = None
-        angle_change_image_file = None
-        
-        # Check for original_image (reference image) - this is image 1
-        if "original_image" in files:
-            input_image_file = files["original_image"]
-        elif "input_image" in files:
-            input_image_file = files["input_image"]
-        elif "image1" in files:
-            input_image_file = files["image1"]
-        elif "reference_image" in files:
-            input_image_file = files["reference_image"]
-        else:
-            return func.HttpResponse(
-                json.dumps({"error": "Missing 'original_image' field"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-        
-        # Check for qwen_generated (generated image to improve) - this is image 2
-        if "qwen_generated" in files:
-            angle_change_image_file = files["qwen_generated"]
-        elif "angle_change_image" in files:
-            angle_change_image_file = files["angle_change_image"]
-        elif "image2" in files:
-            angle_change_image_file = files["image2"]
-        elif "target_image" in files:
-            angle_change_image_file = files["target_image"]
-        else:
-            return func.HttpResponse(
-                json.dumps({"error": "Missing 'qwen_generated' field"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-        
-        # Read image data
-        input_image_data = input_image_file.stream.read()
-        angle_change_image_data = angle_change_image_file.stream.read()
-        
-        if not input_image_data:
-            return func.HttpResponse("Empty original_image file uploaded.", status_code=400)
-        if not angle_change_image_data:
-            return func.HttpResponse("Empty qwen_generated file uploaded.", status_code=400)
-        
-        
-        
-     
-        # Convert to PIL Images
-        input_pil_image = Image.open(io.BytesIO(input_image_data))
-        angle_change_pil_image = Image.open(io.BytesIO(angle_change_image_data))
-        
-        # Define the prompt
-        prompt_final = (
-            """use the information in image 1 to upscale image 2 while maintaining the composition of image 2. Fix items in image 2 that are not clear or hallucinated"""
-        )
-        
-        logging.info("Calling Gemini API for fix_and_upscale")
-        
-        # Call Gemini API
-        response = client_google.models.generate_content(
-            model="gemini-3-pro-image-preview",
-            contents=[
-                prompt_final,
-                input_pil_image,
-                angle_change_pil_image,
-            ],
-            config=types.GenerateContentConfig(
-                response_modalities=['TEXT', 'IMAGE'],
-                image_config=types.ImageConfig(
-                    image_size="4K"
-                ),
-            )
-        )
-        
-        # Process Gemini API response
-        generated_image_bytes = None
-        generated_text = None
-        
-        for part in response.parts:
-            if part.text is not None:
-                generated_text = part.text
-                logging.info(f"Gemini text response: {generated_text}")
-            elif img := part.as_image():
-                # Convert the generated image to bytes
-                # Save to temporary file first, then read as bytes
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
-                    tmp_path = tmp_file.name
-                
-                try:
-                    img.save(tmp_path)
-                    with open(tmp_path, 'rb') as f:
-                        generated_image_bytes = f.read()
-                    logging.info(f"Generated image received from Gemini API ({len(generated_image_bytes)} bytes)")
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-        
-        if generated_image_bytes is None:
-            raise RuntimeError("No image was generated by the API. The response may have contained only text.")
-        
-        # Convert to PNG bytes for response
-        png_bytes, out_name = _to_png_bytes(generated_image_bytes)
-        
-        # Calculate total function execution time
-        overall_end_time = time.time()
-        total_function_time = overall_end_time - overall_start_time
-        logging.info(f"Total function execution time: {total_function_time:.3f} seconds")
-        
-        # Inline PNG response for immediate preview
-        response_headers = {
-            "Content-Disposition": f'inline; filename="{out_name}"',
-            # Add CORS if your frontend is on another origin:
-            # "Access-Control-Allow-Origin": "*",
-        }
-        
-        return func.HttpResponse(
-            body=png_bytes,
-            status_code=200,
-            mimetype="image/png",
-            headers=response_headers
-        )
-        
-    except Exception as e:
-        logging.error(f"Error in fix_and_upscale: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500,
-            mimetype="application/json"
-        )
-        
-@app.route(route="color-grade-upscale")
-def color_grade_upscale(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Color grade an image using two input images.
-    Expects multipart/form-data with:
-    - original_image (file) - reference image
-    - color_grade_image (file) - generated image to improve
-    """
-    try:
-        # Start overall timing
-        import time
-        overall_start_time = time.time()
-        
-        # Expect multipart/form-data with two image files
-        files = req.files or {}
-        form = req.form or {}
-        
-        logging.info(f"Entered fix_and_upscale")
-        logging.info(f"Request: {req}")
-        logging.info(f"Form: {form}")
-        logging.info(f"Files: {list(files.keys())}")
-        
-        # Get the two required images - matching frontend field names
-        input_image_file = None
-        angle_change_image_file = None
-        
-        # Check for original_image (reference image) - this is image 1
-        if "original_image" in files:
-            input_image_file = files["original_image"]
-        elif "input_image" in files:
-            input_image_file = files["input_image"]
-        elif "image1" in files:
-            input_image_file = files["image1"]
-        elif "reference_image" in files:
-            input_image_file = files["reference_image"]
-        else:
-            return func.HttpResponse(
-                json.dumps({"error": "Missing 'original_image' field"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-        
-        # Check for qwen_generated (generated image to improve) - this is image 2
-        if "qwen_generated" in files:
-            angle_change_image_file = files["qwen_generated"]
-        elif "angle_change_image" in files:
-            angle_change_image_file = files["angle_change_image"]
-        elif "image2" in files:
-            angle_change_image_file = files["image2"]
-        elif "target_image" in files:
-            angle_change_image_file = files["target_image"]
-        else:
-            return func.HttpResponse(
-                json.dumps({"error": "Missing 'qwen_generated' field"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-        
-        # Read image data
-        input_image_data = input_image_file.stream.read()
-        angle_change_image_data = angle_change_image_file.stream.read()
-        
-        if not input_image_data:
-            return func.HttpResponse("Empty original_image file uploaded.", status_code=400)
-        if not angle_change_image_data:
-            return func.HttpResponse("Empty qwen_generated file uploaded.", status_code=400)
-        
-        
-        
-     
-        # Convert to PIL Images
-        input_pil_image = Image.open(io.BytesIO(input_image_data))
-        angle_change_pil_image = Image.open(io.BytesIO(angle_change_image_data))
-        
-        # Define the prompt
-        prompt_final = (
-            """use the information in image 1 to upscale image 2 while maintaining the color grade & composition of image 2. Fix items in image 2 that are not clear or hallucinated"""
-        )
-        
-        logging.info("Calling Gemini API for fix_and_upscale")
-        
-        # Call Gemini API
-        response = client_google.models.generate_content(
-            model="gemini-3-pro-image-preview",
-            contents=[
-                prompt_final,
-                input_pil_image,
-                angle_change_pil_image,
-            ],
-            config=types.GenerateContentConfig(
-                response_modalities=['TEXT', 'IMAGE'],
-                image_config=types.ImageConfig(
-                    image_size="4K"
-                ),
-            )
-        )
-        
-        # Process Gemini API response
-        generated_image_bytes = None
-        generated_text = None
-        
-        for part in response.parts:
-            if part.text is not None:
-                generated_text = part.text
-                logging.info(f"Gemini text response: {generated_text}")
-            elif img := part.as_image():
-                # Convert the generated image to bytes
-                # Save to temporary file first, then read as bytes
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
-                    tmp_path = tmp_file.name
-                
-                try:
-                    img.save(tmp_path)
-                    with open(tmp_path, 'rb') as f:
-                        generated_image_bytes = f.read()
-                    logging.info(f"Generated image received from Gemini API ({len(generated_image_bytes)} bytes)")
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-        
-        if generated_image_bytes is None:
-            raise RuntimeError("No image was generated by the API. The response may have contained only text.")
-        
-        # Convert to PNG bytes for response
-        png_bytes, out_name = _to_png_bytes(generated_image_bytes)
-        
-        # Calculate total function execution time
-        overall_end_time = time.time()
-        total_function_time = overall_end_time - overall_start_time
-        logging.info(f"Total function execution time: {total_function_time:.3f} seconds")
-        
-        # Inline PNG response for immediate preview
-        response_headers = {
-            "Content-Disposition": f'inline; filename="{out_name}"',
-            # Add CORS if your frontend is on another origin:
-            # "Access-Control-Allow-Origin": "*",
-        }
-        
-        return func.HttpResponse(
-            body=png_bytes,
-            status_code=200,
-            mimetype="image/png",
-            headers=response_headers
-        )
-        
-    except Exception as e:
-        logging.error(f"Error in fix_and_upscale: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500,
-            mimetype="application/json"
-        )
-
-
-@app.route(route="character-create")
+@app.route(route="angle-generate")
 def create(req: func.HttpRequest) -> func.HttpResponse:
     try:
         # Start overall timing
@@ -374,7 +63,13 @@ def create(req: func.HttpRequest) -> func.HttpResponse:
         logging.info(f"Files: {files}")
         
         prompt = form.get("prompt", "")
+        ai_angle_change = form.get("ai_angle_change", "false").lower() == "true"
         
+        # If ai_angle_change is True, randomly select a camera angle
+        if ai_angle_change:
+            selected_angle = random.choice(CAMERA_ANGLE_OPTIONS)
+            prompt = selected_angle
+            logging.info(f"AI angle change enabled - randomly selected angle: {selected_angle}")
         
         logging.info(f"Prompt: {prompt}")
         #if not prompt:
@@ -396,7 +91,7 @@ def create(req: func.HttpRequest) -> func.HttpResponse:
         if not data:
             return func.HttpResponse("Empty file uploaded.")
         if len(data) > MAX_BYTES:
-            return func.HttpResponse(f"File '{filename}' exceeds {MAX_BYTES//10024//10024} MB limit.", 413)
+            return func.HttpResponse(f"File '{filename}' exceeds {MAX_BYTES//1024//1024} MB limit.", 413)
 
         # Get image type from FileStorage object
         file_mimetype = getattr(file, 'content_type', 'unknown')
@@ -426,7 +121,7 @@ def create(req: func.HttpRequest) -> func.HttpResponse:
         
         # Step 2: Scale the image
         step2_start = time.time()
-        scaled_image = comfy_image
+        scaled_image = scale(comfy_image)
         step2_end = time.time()
         step2_time = step2_end - step2_start
         logging.info(f"Step 2 - scale: {step2_time:.3f} seconds")
@@ -438,11 +133,17 @@ def create(req: func.HttpRequest) -> func.HttpResponse:
         step3_time = step3_end - step3_start
         logging.info(f"Step 3 - comfyui_image_to_binary: {step3_time:.3f} seconds")
         
-        base64_image_comfyui = encode_image(byte_converted_image)
-        
         # Total ComfyUI processing time
         total_comfyui_time = step1_time + step2_time + step3_time
         logging.info(f"Total ComfyUI processing: {total_comfyui_time:.3f} seconds")
+
+        # Get aspect ratio of scaled image
+        width, height, aspect_ratio, aspect_ratio_str = get_aspect_ratio(scaled_image)
+        logging.info(f"Scaled image dimensions: {width}x{height}, aspect ratio: {aspect_ratio_str} ({aspect_ratio:.3f})")
+        payload["aspect_ratio"] = aspect_ratio_str
+
+        base64_image_comfyui = encode_image(byte_converted_image)
+        payload["input_image"] = f"data:{image_info['mimetype']};base64,{base64_image_comfyui}"
 
         response = client.responses.create(
             model="gpt-4.1-mini",
@@ -453,7 +154,7 @@ def create(req: func.HttpRequest) -> func.HttpResponse:
                         {
                             "type": "input_text",
                             "text": f"Use the rules to generate a prompt based on the user's prompt and the image. "
-                                    f"If no user prompt is provided, use the image to generate a prompt. {CHARACTER_PROMPT}"
+                                    f"If no user prompt is provided, use the image to generate a prompt. {Angle_Kontext_Prompt}"
                         },
                     ],
                 },
@@ -472,60 +173,34 @@ def create(req: func.HttpRequest) -> func.HttpResponse:
                 },
             ],
         )
-        
-        logging.info(f"OpenAI Response: {response.output_text}")
-        prompt = response.output_text
 
-        # Convert byte_converted_image to PIL Image for Gemini API
-        pil_image = Image.open(io.BytesIO(byte_converted_image))
         
-        # Use Gemini API to generate image
-        logging.info(f"Calling Gemini API with prompt: {prompt}")
-        response = client_google.models.generate_content(
-            model="gemini-3-pro-image-preview",
-            contents=[
-                prompt if prompt else "Generate a character image based on this image",
-                pil_image,
-            ],
-            config=types.GenerateContentConfig(
-                response_modalities=['TEXT', 'IMAGE'],
-                image_config=types.ImageConfig(
-                    image_size="4K"
-                ),
-            )
-        )
-
-        # Process Gemini API response
-        generated_image_bytes = None
-        generated_text = None
+        logging.info(f"Open AI Response: {response.output_text}")
+        payload["prompt"] = response.output_text
+        # Here you could call Freepik with (data, prompt) and get edited bytes back.
+        # For now, we just convert the uploaded image to PNG and return it inline.
+        response = requests.post(url, json=payload, headers=api_headers)
+        response_data = response.json()
+        logging.info(f"Flux Response: {response_data}")
         
-        for part in response.parts:
-            if part.text is not None:
-                generated_text = part.text
-                logging.info(f"Gemini text response: {generated_text}")
-            elif img := part.as_image():
-                # Convert the generated image to bytes
-                # Save to temporary file first, then read as bytes
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
-                    tmp_path = tmp_file.name
-                
-                try:
-                    img.save(tmp_path)
-                    with open(tmp_path, 'rb') as f:
-                        generated_image_bytes = f.read()
-                    logging.info(f"Generated image received from Gemini API ({len(generated_image_bytes)} bytes)")
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-        
-        if generated_image_bytes:
-            # Use the generated image from Gemini
-            logging.info(f"Result image sent to the frontend")
-            png_bytes, out_name = _to_png_bytes(generated_image_bytes)
+        if "polling_url" in response_data:
+            polling_url = response_data["polling_url"]
+            logging.info(f"Polling URL: {polling_url}")
+            
+            # Poll the URL until the image is ready
+            result_image = poll_for_result(polling_url, api_headers)
+            
+            if result_image:
+                # Convert the result image to bytes for response
+                logging.info(f"Result image Sent to the frontend")
+                png_bytes, out_name = _to_png_bytes(result_image)
+            else:
+                # Fallback to original processed image if polling fails
+                logging.error("No result image in response")
+                png_bytes, out_name = _to_png_bytes(byte_converted_image)
         else:
-            # Fallback to original processed image if Gemini didn't return an image
-            logging.error("No image generated by Gemini API, using fallback")
+            logging.error("No polling_url in response")
+            # Fallback to original processed image
             png_bytes, out_name = _to_png_bytes(byte_converted_image)
         
         # Inline PNG response for immediate preview
@@ -553,205 +228,9 @@ def create(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
-        
-@app.route(route="character-masked-create")
-def create_masked(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        # Start overall timing
-        import time
-        overall_start_time = time.time()
-        # Expect multipart/form-data with fields: prompt (text) + image (file)
-        files = req.files or {}
-        form = req.form or {}
-        
-        logging.info(f"Entered")
-        logging.info(f"Request: {req}")
-        logging.info(f"Form: {form}")
-        logging.info(f"Files: {files}")
-        
-        prompt = form.get("prompt", "")
-        
-        
-        logging.info(f"Prompt: {prompt}")
-        #if not prompt:
-            #return func.HttpResponse("Missing 'prompt' field.")
 
-        # Check for either 'image' or 'file' field
-        file_key = None
-        if "image" in files:
-            file_key = "image"
-        elif "file" in files:
-            file_key = "file"
-        else:
-            return func.HttpResponse("Missing 'image' or 'file' field.")
-
-        file = files[file_key]  # FileStorage-like object
-        filename = getattr(file, "filename", None) or "upload"
-        data = file.stream.read()
-
-        if not data:
-            return func.HttpResponse("Empty file uploaded.")
-        if len(data) > MAX_BYTES:
-            return func.HttpResponse(f"File '{filename}' exceeds {MAX_BYTES//10024//10024} MB limit.", 413)
-
-        # Get image type from FileStorage object
-        file_mimetype = getattr(file, 'content_type', 'unknown')
-        file_extension = os.path.splitext(filename)[1].lower() if filename else ''
-        
-        image_info = {
-            'filename': filename,
-            'mimetype': file_mimetype,
-            'extension': file_extension,
-            'size_bytes': len(data)
-        }
-        logging.info(f"File info: {image_info}")
-
-        # (Optional) keep a temp copy if you need later (e.g., logging / retries)
-        
-        # Getting the Base64 string
-        #base64_image = encode_image(path_temp)
-        
-        # Start timing for ComfyUI processing steps
-        
-        # Step 1: Convert binary to ComfyUI format
-        step1_start = time.time()
-        comfy_image = binary_to_comfyui_image(data) # convert the uploaded image to the format used by ComfyUI
-        step1_end = time.time()
-        step1_time = step1_end - step1_start
-        logging.info(f"Step 1 - binary_to_comfyui_image: {step1_time:.3f} seconds")
-        
-        # Step 2: Scale the image
-        step2_start = time.time()
-        scaled_image = comfy_image
-        step2_end = time.time()
-        step2_time = step2_end - step2_start
-        logging.info(f"Step 2 - scale: {step2_time:.3f} seconds")
-        
-        # Step 3: Convert back to binary
-        step3_start = time.time()
-        byte_converted_image = comfyui_image_to_binary(scaled_image)
-        step3_end = time.time()
-        step3_time = step3_end - step3_start
-        logging.info(f"Step 3 - comfyui_image_to_binary: {step3_time:.3f} seconds")
-        
-        base64_image_comfyui = encode_image(byte_converted_image)
-        
-        # Total ComfyUI processing time
-        total_comfyui_time = step1_time + step2_time + step3_time
-        logging.info(f"Total ComfyUI processing: {total_comfyui_time:.3f} seconds")
-
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[
-                {
-                    "role": "developer",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": f"Use the rules to generate a prompt based on the user's prompt and the image. "
-                                    f"If no user prompt is provided, use the image to generate a prompt. {CHARACTER_PROMPT_MASKED}"
-                        },
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": prompt if prompt else ""
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:{image_info['mimetype']};base64,{base64_image_comfyui}"
-                        },
-                    ],
-                },
-            ],
-        )
-        
-        logging.info(f"OpenAI Response: {response.output_text}")
-        prompt = response.output_text
-
-        # Convert byte_converted_image to PIL Image for Gemini API
-        pil_image = Image.open(io.BytesIO(byte_converted_image))
-        
-        # Use Gemini API to generate image
-        logging.info(f"Calling Gemini API with prompt: {prompt}")
-        response = client_google.models.generate_content(
-            model="gemini-3-pro-image-preview",
-            contents=[
-                prompt if prompt else "Generate a character image based on this image",
-                pil_image,
-            ],
-            config=types.GenerateContentConfig(
-                response_modalities=['TEXT', 'IMAGE'],
-                image_config=types.ImageConfig(
-                    image_size="4K"
-                ),
-            )
-        )
-
-        # Process Gemini API response
-        generated_image_bytes = None
-        generated_text = None
-        
-        for part in response.parts:
-            if part.text is not None:
-                generated_text = part.text
-                logging.info(f"Gemini text response: {generated_text}")
-            elif img := part.as_image():
-                # Convert the generated image to bytes
-                # Save to temporary file first, then read as bytes
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
-                    tmp_path = tmp_file.name
-                
-                try:
-                    img.save(tmp_path)
-                    with open(tmp_path, 'rb') as f:
-                        generated_image_bytes = f.read()
-                    logging.info(f"Generated image received from Gemini API ({len(generated_image_bytes)} bytes)")
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-        
-        if generated_image_bytes:
-            # Use the generated image from Gemini
-            logging.info(f"Result image sent to the frontend")
-            png_bytes, out_name = _to_png_bytes(generated_image_bytes)
-        else:
-            # Fallback to original processed image if Gemini didn't return an image
-            logging.error("No image generated by Gemini API, using fallback")
-            png_bytes, out_name = _to_png_bytes(byte_converted_image)
-        
-        # Inline PNG response for immediate preview
-        response_headers = {
-            "Content-Disposition": f'inline; filename="{out_name}"',
-            # Add CORS if your frontend is on another origin:
-            # "Access-Control-Allow-Origin": "*",
-        }
-        
-        # Calculate total function execution time
-        overall_end_time = time.time()
-        total_function_time = overall_end_time - overall_start_time
-        logging.info(f"Total function execution time: {total_function_time:.3f} seconds")
-        
-        return func.HttpResponse(
-            body=png_bytes,
-            status_code=200,
-            mimetype="image/png",
-            headers=response_headers
-        )
-
-    except Exception as e:
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500,
-            mimetype="application/json"
-        )
-        
-@app.route(route="character-create-batch")
-def create_character_batch(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="angle-generate-batch")
+def create_batch(req: func.HttpRequest) -> func.HttpResponse:
     """
     Handle folder uploads with multiple images.
     Expects multipart/form-data with:
@@ -771,6 +250,14 @@ def create_character_batch(req: func.HttpRequest) -> func.HttpResponse:
         logging.info(f"Files: {list(files.keys())}")
         
         prompt = form.get("prompt", "")
+        ai_angle_change = form.get("ai_angle_change", "false").lower() == "true"
+        
+        # If ai_angle_change is True, randomly select a camera angle
+        if ai_angle_change:
+            selected_angle = random.choice(CAMERA_ANGLE_OPTIONS)
+            prompt = selected_angle
+            logging.info(f"AI angle change enabled - randomly selected angle: {selected_angle}")
+        
         logging.info(f"Prompt: {prompt}")
         
         # Collect all image files
@@ -825,7 +312,7 @@ def create_character_batch(req: func.HttpRequest) -> func.HttpResponse:
                 
                 # Step 2: Scale the image
                 step2_start = time.time()
-                scaled_image = comfy_image
+                scaled_image = scale(comfy_image)
                 step2_end = time.time()
                 step2_time = step2_end - step2_start
                 
@@ -835,10 +322,18 @@ def create_character_batch(req: func.HttpRequest) -> func.HttpResponse:
                 step3_end = time.time()
                 step3_time = step3_end - step3_start
                 
+                # Get aspect ratio
+                width, height, aspect_ratio, aspect_ratio_str = get_aspect_ratio(scaled_image)
+                
+                # Prepare payload for this image
+                image_payload = payload.copy()
+                image_payload["aspect_ratio"] = aspect_ratio_str
+                
                 base64_image_comfyui = encode_image(byte_converted_image)
+                image_payload["input_image"] = f"data:{image_info['mimetype']};base64,{base64_image_comfyui}"
                 
                 # Generate prompt using OpenAI
-                openai_response = client.responses.create(
+                response = client.responses.create(
                     model="gpt-4.1-mini",
                     input=[
                         {
@@ -847,7 +342,7 @@ def create_character_batch(req: func.HttpRequest) -> func.HttpResponse:
                                 {
                                     "type": "input_text",
                                     "text": f"Use the rules to generate a prompt based on the user's prompt and the image. "
-                                            f"If no user prompt is provided, use the image to generate a prompt. {CHARACTER_PROMPT}"
+                                            f"If no user prompt is provided, use the image to generate a prompt. {Angle_Kontext_Prompt}"
                                 },
                             ],
                         },
@@ -867,76 +362,43 @@ def create_character_batch(req: func.HttpRequest) -> func.HttpResponse:
                     ],
                 )
                 
-                generated_prompt = openai_response.output_text
-                logging.info(f"OpenAI Response for {image_info['filename']}: {generated_prompt}")
+                image_payload["prompt"] = response.output_text
                 
-                # Convert byte_converted_image to PIL Image for Gemini API
-                pil_image = Image.open(io.BytesIO(byte_converted_image))
+                # Call Flux API
+                flux_response = requests.post(url, json=image_payload, headers=api_headers)
+                flux_response_data = flux_response.json()
                 
-                # Use Gemini API to generate image
-                logging.info(f"Calling Gemini API for {image_info['filename']} with prompt: {generated_prompt}")
-                gemini_response = client_google.models.generate_content(
-                    model="gemini-3-pro-image-preview",
-                    contents=[
-                        generated_prompt if generated_prompt else "Generate a character image based on this image",
-                        pil_image,
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_modalities=['TEXT', 'IMAGE'],
-                        image_config=types.ImageConfig(
-                            image_size="4K"
-                        ),
-                    )
-                )
-                
-                # Process Gemini API response
-                generated_image_bytes = None
-                generated_text = None
-                
-                for part in gemini_response.parts:
-                    if part.text is not None:
-                        generated_text = part.text
-                        logging.info(f"Gemini text response for {image_info['filename']}: {generated_text}")
-                    elif img := part.as_image():
-                        # Convert the generated image to bytes
-                        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
-                            tmp_path = tmp_file.name
-                        
-                        try:
-                            img.save(tmp_path)
-                            with open(tmp_path, 'rb') as f:
-                                generated_image_bytes = f.read()
-                            logging.info(f"Generated image received from Gemini API for {image_info['filename']} ({len(generated_image_bytes)} bytes)")
-                        finally:
-                            # Clean up temporary file
-                            if os.path.exists(tmp_path):
-                                os.unlink(tmp_path)
-                
-                if generated_image_bytes:
-                    png_bytes, out_name = _to_png_bytes(generated_image_bytes)
-                    results.append({
-                        "filename": image_info['filename'],
-                        "processed_filename": out_name,
-                        "image_data": base64.b64encode(png_bytes).decode('utf-8'),
-                        "status": "success",
-                        "processing_time": step1_time + step2_time + step3_time
-                    })
-                    successful_count += 1
-                    logging.info(f"Successfully processed: {image_info['filename']}")
+                if "polling_url" in flux_response_data:
+                    polling_url = flux_response_data["polling_url"]
+                    result_image = poll_for_result(polling_url, api_headers)
+                    
+                    if result_image:
+                        png_bytes, out_name = _to_png_bytes(result_image)
+                        results.append({
+                            "filename": image_info['filename'],
+                            "processed_filename": out_name,
+                            "image_data": base64.b64encode(png_bytes).decode('utf-8'),
+                            "status": "success",
+                            "processing_time": step1_time + step2_time + step3_time
+                        })
+                        successful_count += 1
+                        logging.info(f"Successfully processed: {image_info['filename']}")
+                    else:
+                        results.append({
+                            "filename": image_info['filename'],
+                            "status": "failed",
+                            "error": "Failed to get result from Flux API"
+                        })
+                        failed_count += 1
+                        logging.error(f"Failed to get result for: {image_info['filename']}")
                 else:
-                    # Fallback to original processed image if Gemini didn't return an image
-                    logging.error(f"No image generated by Gemini API for {image_info['filename']}, using fallback")
-                    png_bytes, out_name = _to_png_bytes(byte_converted_image)
                     results.append({
                         "filename": image_info['filename'],
-                        "processed_filename": out_name,
-                        "image_data": base64.b64encode(png_bytes).decode('utf-8'),
-                        "status": "success",
-                        "processing_time": step1_time + step2_time + step3_time,
-                        "note": "Used fallback image"
+                        "status": "failed",
+                        "error": "No polling URL in Flux response"
                     })
-                    successful_count += 1
-                    logging.info(f"Processed with fallback: {image_info['filename']}")
+                    failed_count += 1
+                    logging.error(f"No polling URL for: {image_info['filename']}")
                     
             except Exception as e:
                 results.append({
@@ -976,8 +438,6 @@ def create_character_batch(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
-
-
 
 @app.route(route="color-grade-generate")
 def create_color_grade(req: func.HttpRequest) -> func.HttpResponse:
